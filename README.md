@@ -1,7 +1,61 @@
 # 💧 WaterGuard v7
 Sistema de monitoreo inteligente de tanques de agua basado en Arduino. Combina lecturas de nivel, temperatura, humedad, luz ambiente y luminosidad para calcular un **Índice de Riesgo Hídrico (IRH)** y una **probabilidad de evaporación** en tiempo real, detectar anomalías con una ventana móvil estadística y avisar al usuario mediante LEDs, buzzer y pantalla OLED.
 
+**Universidad de La Sabana** — Facultad de Ingeniería, Ingeniería Informática
+**Curso:** IoT (Internet of Things)
+**Integrantes:** Juan José Riaño Zabaleta · Santiago Peña Beltrán
+
 > 📖 **¿Quieres profundizar?** Toda la documentación extendida —incluyendo el análisis offline con K-Means, el detalle de las fórmulas del IRH y de la probabilidad de evaporación, y el diseño del cableado— está en la **[Wiki del repositorio](../../wiki)**.
+
+---
+
+## 🧩 Metodología de desarrollo
+
+### 1. Análisis del problema y del entorno
+El punto de partida fue entender el entorno real que se quería monitorear: un tanque de agua expuesto a condiciones ambientales variables. Para eso se identificaron los factores fundamentales que inciden sobre el riesgo hídrico y la evaporación: **agua** (nivel y temperatura), **calor** (temperatura ambiente y del líquido), **caudal y viento** (movimiento de aire que acelera la evaporación), **refrigeración** (condiciones que la reducen) y la **acumulación** de estos efectos en el tiempo. Este análisis definió qué debía medir el sistema y por qué, antes de pensar en sensores o en código.
+
+### 2. Diseño del ambiente de pruebas
+Con los factores identificados, se construyó un banco de pruebas capaz de simular ese ecosistema de forma controlada, usando una **nevera de icopor** como cámara cerrada. Sobre esta base se implementaron:
+- **Aluminio** en las paredes internas, para concentrar y conducir el calor de forma uniforme.
+- Un **bombillo halógeno**, como fuente de calor controlada.
+- **Ventiladores**, para generar caudal de aire y simular viento dentro de la cámara.
+
+Este montaje permitió reproducir de forma repetible las condiciones de calor, humedad y viento que el sistema final debía detectar en campo.
+
+<p align="center">
+  <img src="BancodePruebas.jpeg" alt="Banco de pruebas: nevera de icopor con aluminio interno, ventilador y fuente de calor" width="48%">
+  <img src="BancodePruebas2.jpeg" alt="Vista frontal del banco de pruebas con el ventilador de refrigeración" width="48%">
+</p>
+<p align="center">
+  <img src="BancodePruebas (2).jpeg" alt="Interior de la nevera de icopor forrado en aluminio, con el bombillo halógeno" width="48%">
+  <img src="BancodePruebas (3).jpeg" alt="Detalle del bombillo halógeno y cableado dentro de la cámara de pruebas" width="48%">
+</p>
+<p align="center"><em>Banco de pruebas — nevera de icopor forrada en aluminio para concentrar el calor, con bombillo halógeno como fuente de calor controlada y ventilador lateral para generar caudal de aire.</em></p>
+
+### 3. Selección de sensores
+La elección de los sensores respondió a un balance entre **cobertura de las variables identificadas**, **costo** (dadas las limitaciones económicas propias de un proyecto de curso) y **escalabilidad futura**, de modo que el diseño pudiera ampliarse más adelante sin rehacer la arquitectura. Esto llevó a la selección final: HC-SR04 (nivel), DS18B20 (temperatura del agua), DHT11 (temperatura/humedad ambiente), KY-018 y fotoresistencia (luz), detallados en la tabla de hardware más abajo.
+
+### 4. Conexión y validación del circuito
+Cada sensor se conectó y se probó de forma individual dentro del ambiente de pruebas para confirmar su correcto funcionamiento y la estabilidad de sus lecturas, antes de integrarlos todos en un mismo circuito y firmware.
+
+<p align="center">
+  <img src="Figura1_montaje.png" alt="Circuito conectado con el sensor de temperatura del agua en el recipiente de prueba" width="48%">
+  <img src="Figura2_montaje.png" alt="Circuito conectado con el sensor sumergido en el tanque de prueba" width="48%">
+</p>
+<p align="center"><em>Figuras 1 y 2 — Circuito integrado (Arduino, pantalla OLED, LEDs indicadores y sensores) conectado y en prueba sobre los recipientes usados para simular el tanque de agua.</em></p>
+
+<p align="center">
+  <img src="Figura3_oled.png" alt="Lectura en la pantalla OLED durante la prueba" width="60%">
+</p>
+<p align="center"><em>Figura 3 — Pantalla OLED reportando en vivo el estado del sistema, nivel, temperatura, humedad, evaporación y sensores activos durante una corrida de prueba.</em></p>
+
+### 5. Desarrollo del firmware asistido por IA
+La lógica de control (cálculo del IRH, probabilidad de evaporación, detección de anomalías y máquina de estados) se desarrolló mediante sesiones de **pair-programming con IA**, iterando sobre el código hasta ajustarlo a los requerimientos del proyecto y a los umbrales validados con los datos reales del banco de pruebas.
+
+<p align="center">
+  <img src="Figura4_linea_tiempo.png" alt="Línea de tiempo de una prueba con perturbaciones deliberadas" width="80%">
+</p>
+<p align="center"><em>Figura 4 — Análisis offline de una corrida de prueba con perturbaciones deliberadas (evento térmico y bloqueo de sensores), usada para validar y ajustar los umbrales de alerta/crítico del IRH.</em></p>
 
 ---
 
