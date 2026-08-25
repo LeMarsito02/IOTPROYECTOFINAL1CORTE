@@ -1,15 +1,24 @@
 /* ============================================================
-   WATER GUARD - v5
-   Cambios frente a v4:
-   - NUEVO: fotoresistencia analogica en A0 (nivel de
-     luminosidad 0-100%, no solo si hay luz o no como el KY-018)
-   - NUEVO: deteccion de anomalias REAL con ventana movil sobre
-     el IRH base. En v4 la variable "anomalias" existia pero
-     nunca se calculaba (quedaba en 0 siempre)
-   - "cluster" (K-Means) se deja documentado como analisis
-     OFFLINE (ver wiki): no tiene sentido reentrenar clusters
-     en un Arduino Uno, se exporta el log por Serial y se
-     procesa aparte
+   WATER GUARD - v7
+   Cambios frente a v6:
+   - La probabilidad de evaporacion ahora aparece como una
+     LECTURA propia (junto a nivel, temperatura, humedad),
+     no mezclada entre los datos internos del IRH. Se muestra
+     con numero y categoria en palabras: BAJA / MEDIA / ALTA.
+   - OLED rediseñada para ser mas facil de leer de un vistazo:
+     el estado del sistema y si hay anomalia activa se
+     imprimen en palabras completas ("Estado: NORMAL",
+     "Anomalia: SI/NO") en vez de codigos de una letra, y la
+     evaporacion tiene su propia fila con numero + categoria.
+
+   Cambios frente a v5 (se mantienen):
+   - Probabilidad de evaporacion (0-100%), calculada
+     combinando VARIAS variables (temp. agua, temp. ambiente,
+     humedad, luminosidad), cada una con su propio peso y
+     normalizada solo sobre los sensores que estan OK en ese
+     momento (mismo patron que el IRH). Ninguna variable sola
+     puede mover el numero por si misma.
+   - Serial + log CSV: columna de evaporacion.
    ============================================================ */
 
 #include <Wire.h>
@@ -40,7 +49,7 @@ U8X8_SSD1306_128X64_NONAME_HW_I2C oled(U8X8_PIN_NONE);
 #define PIN_BUZZER          8
 #define PIN_LUZ             9   /* KY-018 digital: si hay luz o no */
 #define PIN_DHT             10
-#define PIN_FOTORESISTENCIA A0  /* nueva: nivel de luminosidad analogico */
+#define PIN_FOTORESISTENCIA A0  /* nivel de luminosidad analogico */
 
 
 /* ============================================================
@@ -66,9 +75,9 @@ float distancia           = NAN;
 float nivel               = NAN;
 bool  luz                 = false;
 
-/* NUEVO: nivel de luminosidad en porcentaje (0-100), a partir
-   de la fotoresistencia. 0 = totalmente oscuro, 100 = luz
-   maxima detectable por el divisor de voltaje.
+/* Nivel de luminosidad en porcentaje (0-100), a partir de la
+   fotoresistencia. 0 = totalmente oscuro, 100 = luz maxima
+   detectable por el divisor de voltaje.
 
    OJO CABLEADO: esto asume un divisor de voltaje foto-
    resistencia + resistencia fija a A0. Segun como quede
@@ -102,8 +111,8 @@ uint8_t fallosDS   = 0;
 /* Sensores que alimentan el IRH: HC-SR04 + DS18B20 + DHT11.
    El KY-018 no entra: es digital y no tiene forma de avisar
    que esta desconectado (siempre "parece" OK). La foto-
-   resistencia tampoco entra al IRH todavia: es informativa
-   (luminosidad ambiente), no mide riesgo hidrico. */
+   resistencia tampoco entra al IRH: es informativa (aunque
+   si participa en la probabilidad de evaporacion). */
 uint8_t sensoresDatos = 0;
 
 
@@ -138,6 +147,10 @@ float IRHbase   = 0;   /* IRH antes de sumar el efecto de anomalias */
 int   anomalias = 0;   /* contador de anomalias detectadas (ventana movil) */
 int   cluster   = 0;   /* reservado: clasificacion K-Means OFFLINE (ver wiki) */
 
+/* NUEVO en v6: probabilidad de evaporacion, 0-100%.
+   NAN cuando no hay suficientes sensores para estimarla. */
+float probabilidadEvaporacion = NAN;
+
 enum EstadoSistema {
   ESTADO_NORMAL,
   ESTADO_ALERTA,
@@ -168,11 +181,6 @@ unsigned long inicioCondicionCritica = 0;
    ventana (sin contar la lectura actual). Si la lectura
    actual se aleja mas de UMBRAL_DESVIACIONES desviaciones
    estandar del promedio reciente, se marca como anomalia.
-
-   Esto detecta cosas como "el nivel bajo demasiado rapido
-   comparado con el comportamiento reciente", que es
-   justamente el tipo de evento critico complejo que pide
-   el enunciado (ej. tasas anomalas de descenso de nivel).
    ============================================================ */
 
 const uint8_t TAM_VENTANA_ANOMALIA = 10;
@@ -184,14 +192,8 @@ uint8_t  muestrasGuardadas = 0;   /* cuantas casillas ya tienen dato real */
 const float UMBRAL_DESVIACIONES   = 2.0;   /* que tan lejos del promedio cuenta como anomalia */
 const int   MAX_ANOMALIAS_CONTADAS = 4;    /* tope para que no se dispare el IRH sin control */
 
-/* Devuelve true si huboanomalia en esta lectura. Ademas deja
-   el valor actual guardado en el historial para la proxima
-   comparacion. */
 bool detectarAnomalia(float valorActual) {
 
-  /* Sin suficientes datos historicos todavia no se puede
-     comparar contra "lo normal" -> no se declara anomalia,
-     solo se va llenando la ventana. */
   if (muestrasGuardadas < 3) {
 
     historialIRH[indiceHistorial] = valorActual;
@@ -201,8 +203,6 @@ bool detectarAnomalia(float valorActual) {
     return false;
   }
 
-  /* Promedio y desviacion estandar de la ventana actual
-     (antes de meter la lectura nueva). */
   float suma = 0;
   for (uint8_t i = 0; i < muestrasGuardadas; i++) {
     suma += historialIRH[i];
@@ -216,8 +216,6 @@ bool detectarAnomalia(float valorActual) {
   }
   float desviacion = sqrt(sumaCuadrados / muestrasGuardadas);
 
-  /* Evita division por cero / ruido cuando la ventana esta
-     casi plana (desviacion muy pequena). */
   const float DESVIACION_MINIMA = 2.0;
   if (desviacion < DESVIACION_MINIMA) {
     desviacion = DESVIACION_MINIMA;
@@ -225,7 +223,6 @@ bool detectarAnomalia(float valorActual) {
 
   bool esAnomalia = fabs(valorActual - promedio) > (UMBRAL_DESVIACIONES * desviacion);
 
-  /* Guardar la lectura actual en el historial circular */
   historialIRH[indiceHistorial] = valorActual;
   indiceHistorial = (indiceHistorial + 1) % TAM_VENTANA_ANOMALIA;
   if (muestrasGuardadas < TAM_VENTANA_ANOMALIA) {
@@ -265,6 +262,22 @@ char letraEstado() {
    Sin esto no se permite declarar CRITICO. */
 bool datosConfiables() {
   return hcOK && (ds18OK || dhtOK);
+}
+
+/* NUEVO en v7: version en palabras de la probabilidad de
+   evaporacion, para no obligar a nadie a interpretar un
+   numero suelto en la pantalla. */
+const __FlashStringHelper* textoEvaporacion() {
+  if (isnan(probabilidadEvaporacion)) return F("--");
+  if (probabilidadEvaporacion < 30)   return F("BAJA");
+  if (probabilidadEvaporacion < 60)   return F("MEDIA");
+  return F("ALTA");
+}
+
+/* NUEVO en v7: version en palabras de si hay anomalias
+   activas ahora mismo (en vez de mostrar solo el contador). */
+const __FlashStringHelper* textoAnomalia() {
+  return (anomalias > 0) ? F("SI") : F("NO");
 }
 
 
@@ -419,7 +432,6 @@ void leerLuz() {
 
 /* ============================================================
    FOTORESISTENCIA (analogica, nivel de luminosidad 0-100%)
-   NUEVO en v5
    ============================================================ */
 
 void leerFotoresistencia() {
@@ -439,16 +451,9 @@ void leerFotoresistencia() {
 /* ============================================================
    IRH
 
-   Se normaliza sobre los sensores DISPONIBLES.
-   Antes, un sensor desconectado sumaba 0 puntos y el IRH
-   bajaba solo: el sistema se veia "NORMAL" justo cuando
-   estaba ciego. Ahora el puntaje se divide entre el maximo
-   posible de lo que si se pudo medir.
-
-   v5: aqui se calcula el IRH BASE (sin anomalias). El ajuste
-   por anomalias se aplica despues, en actualizarAnaliticaIRH(),
-   una vez que se compara el IRH base contra su propio
-   historial reciente.
+   Se normaliza sobre los sensores DISPONIBLES. Aqui se calcula
+   el IRH BASE (sin anomalias); el ajuste por anomalias se
+   aplica despues en actualizarAnaliticaIRH().
    ============================================================ */
 
 void calcularIRHBase() {
@@ -497,13 +502,9 @@ void calcularIRHBase() {
 }
 
 
-/* NUEVO en v5: corre la deteccion de anomalias sobre el IRH
-   base y produce el IRH final que usa el resto del sistema
-   (maquina de estados, OLED, Serial). */
 void actualizarAnaliticaIRH() {
 
   if (sensoresDatos == 0) {
-    /* sin datos no tiene sentido comparar contra historial */
     IRH = 0;
     return;
   }
@@ -513,14 +514,78 @@ void actualizarAnaliticaIRH() {
   if (anomaliaDetectada && anomalias < MAX_ANOMALIAS_CONTADAS) {
     anomalias++;
   } else if (!anomaliaDetectada && anomalias > 0) {
-    /* las anomalias "se enfrian" solas cuando el sistema
-       vuelve a comportarse de forma estable, en vez de
-       quedar acumuladas para siempre */
     anomalias--;
   }
 
   IRH = IRHbase + (anomalias * 5.0);
   IRH = constrain(IRH, 0, 100);
+}
+
+
+/* ============================================================
+   PROBABILIDAD DE EVAPORACION (heuristica, 0-100%)
+   NUEVO en v6
+
+   No es un modelo fisico exacto (para eso harian falta datos
+   como viento y presion, que este hardware no mide). Es un
+   indice compuesto que combina VARIAS senales -temperatura
+   del agua, temperatura ambiente, humedad y luminosidad (como
+   proxy de radiacion/calor solar)- para que ninguna variable
+   sola pueda mover el numero por si misma.
+
+   Se normaliza sobre los sensores DISPONIBLES, igual que el
+   IRH: si falta un sensor, no resta puntaje, simplemente no
+   participa ni el ni su peso.
+
+   Pesos usados (suman 100 cuando todo esta disponible):
+     - Temperatura agua      : 35
+     - Humedad                : 30
+     - Luminosidad             : 20
+     - Temperatura ambiente   : 15
+   ============================================================ */
+
+void calcularProbabilidadEvaporacion() {
+
+  float puntos    = 0;
+  float puntosMax = 0;
+
+  /* TEMPERATURA AGUA (peso 35): mapea 0-40 C -> 0-100% */
+  if (ds18OK && !isnan(temperaturaAgua)) {
+    float factor = (temperaturaAgua / 40.0) * 100.0;
+    factor = constrain(factor, 0, 100);
+    puntos    += factor * 0.35;
+    puntosMax += 100.0 * 0.35;
+  }
+
+  /* HUMEDAD (peso 30): mas humedad -> MENOS evaporacion */
+  if (dhtOK && !isnan(humedad)) {
+    float factor = 100.0 - humedad;
+    factor = constrain(factor, 0, 100);
+    puntos    += factor * 0.30;
+    puntosMax += 100.0 * 0.30;
+  }
+
+  /* LUMINOSIDAD (peso 20): proxy de calor/radiacion solar */
+  if (!isnan(luminosidad)) {
+    puntos    += luminosidad * 0.20;
+    puntosMax += 100.0 * 0.20;
+  }
+
+  /* TEMPERATURA AMBIENTE (peso 15): mapea 0-40 C -> 0-100% */
+  if (dhtOK && !isnan(temperaturaAmbiente)) {
+    float factor = (temperaturaAmbiente / 40.0) * 100.0;
+    factor = constrain(factor, 0, 100);
+    puntos    += factor * 0.15;
+    puntosMax += 100.0 * 0.15;
+  }
+
+  if (puntosMax == 0) {
+    probabilidadEvaporacion = NAN;   /* sin datos suficientes */
+    return;
+  }
+
+  probabilidadEvaporacion = (puntos / puntosMax) * 100.0;
+  probabilidadEvaporacion = constrain(probabilidadEvaporacion, 0, 100);
 }
 
 
@@ -538,21 +603,18 @@ void actualizarAnaliticaIRH() {
 
 void actualizarEstado() {
 
-  /* --- Fallo total --- */
   if (sensoresDatos == 0) {
     estado                 = ESTADO_ERROR;
     inicioCondicionCritica = 0;
     return;
   }
 
-  /* --- Sin datos suficientes para afirmar nada --- */
   if (!datosConfiables()) {
     estado                 = ESTADO_DEGRADADO;
     inicioCondicionCritica = 0;
     return;
   }
 
-  /* --- Cronometro de la condicion critica --- */
   if (IRH >= UMBRAL_CRITICO) {
 
     if (inicioCondicionCritica == 0) {
@@ -561,8 +623,6 @@ void actualizarEstado() {
 
   } else {
 
-    /* histeresis: si ya estaba en CRITICO, no lo suelto
-       hasta bajar del umbral de salida */
     if (!(estado == ESTADO_CRITICO && IRH >= UMBRAL_SALIDA_CRITICO)) {
       inicioCondicionCritica = 0;
     }
@@ -580,7 +640,6 @@ void actualizarEstado() {
     estado = ESTADO_CRITICO;
   }
   else if (IRH >= UMBRAL_ALERTA || inicioCondicionCritica != 0) {
-    /* IRH alto pero aun sin confirmar -> ALERTA, no CRITICO */
     estado = ESTADO_ALERTA;
   }
   else {
@@ -611,9 +670,7 @@ void actualizarSalidas() {
       digitalWrite(PIN_LED_VERDE,    LOW);
       digitalWrite(PIN_LED_AMARILLO, HIGH);
       digitalWrite(PIN_LED_ROJO,     LOW);
-      noTone(PIN_BUZZER);          /* faltaba en v3: el buzzer
-                                      se quedaba sonando al
-                                      pasar de CRITICO a ALERTA */
+      noTone(PIN_BUZZER);
       break;
 
     case ESTADO_DEGRADADO:
@@ -636,8 +693,6 @@ void actualizarSalidas() {
       digitalWrite(PIN_LED_AMARILLO, LOW);
       digitalWrite(PIN_LED_ROJO,     parpadeoRapido ? HIGH : LOW);
 
-      /* pitido intermitente y mas agudo: se distingue
-         del critico, que es continuo */
       if (parpadeoRapido) tone(PIN_BUZZER, 2500);
       else                noTone(PIN_BUZZER);
       break;
@@ -690,65 +745,67 @@ void actualizarOLED() {
 
   oled.clear();
 
-  /* FILA 2 */
-  oled.setCursor(1, 2);
-  oled.print(textoEstado());
-  oled.print(F(" IRH:"));
-  if (sensoresDatos == 0) oled.print(F("--"));
-  else                    oled.print((int)IRH);
+  /* v7: pantalla reordenada para que se lea como frases
+     cortas en vez de codigos abreviados. El IRH numerico
+     crudo se saca de la vista principal (sigue disponible
+     completo por Serial); aqui lo que importa es que se
+     entienda de un vistazo. */
 
-  /* FILA 3 */
+  /* FILA 2 - estado del sistema, en palabras */
+  oled.setCursor(1, 2);
+  oled.print(F("Estado: "));
+  oled.print(textoEstado());
+
+  /* FILA 3 - anomalias, en palabras (no un contador crudo) */
   oled.setCursor(1, 3);
+  oled.print(F("Anomalia: "));
+  oled.print(textoAnomalia());
+
+  /* FILA 4 - nivel de tanque y temp. del agua */
+  oled.setCursor(1, 4);
   oled.print(F("Niv:"));
   if (isnan(nivel)) oled.print(F("--"));
-  else              oled.print(nivel, 1);
-
-  oled.print(F(" Agua:"));
+  else              oled.print(nivel, 0);
+  oled.print(F("% Agua:"));
   if (isnan(temperaturaAgua)) oled.print(F("--"));
-  else                        oled.print(temperaturaAgua, 1);
+  else                        oled.print(temperaturaAgua, 0);
   oled.print(F("C"));
 
-  /* FILA 4 */
-  oled.setCursor(1, 4);
+  /* FILA 5 - ambiente y humedad */
+  oled.setCursor(1, 5);
   oled.print(F("Amb:"));
   if (isnan(temperaturaAmbiente)) oled.print(F("--"));
-  else                            oled.print(temperaturaAmbiente, 1);
-
+  else                            oled.print(temperaturaAmbiente, 0);
   oled.print(F("C Hum:"));
   if (isnan(humedad)) oled.print(F("--"));
-  else                oled.print(humedad, 1);
+  else                oled.print(humedad, 0);
   oled.print(F("%"));
 
-  /* FILA 5 */
-  oled.setCursor(1, 5);
-  oled.print(F("Luz:"));
-  oled.print(luz ? 'S' : 'N');
-
-  oled.print(F(" Lum:"));
-  if (isnan(luminosidad)) oled.print(F("--"));
-  else                    oled.print((int)luminosidad);
-  oled.print(F("%"));
-
-  /* FILA 6 */
+  /* FILA 6 - probabilidad de evaporacion, numero + categoria
+     en palabras (esto es lo que pidio mostrarse claro) */
   oled.setCursor(1, 6);
-  oled.print(F("Anom:"));
-  oled.print(anomalias);
-  oled.print(F(" Sen:"));
-  oled.print(sensoresDatos);
-  oled.print(F("/3"));
+  oled.print(F("Evapora: "));
+  if (isnan(probabilidadEvaporacion)) {
+    oled.print(F("--"));
+  } else {
+    oled.print((int)probabilidadEvaporacion);
+    oled.print(F("% "));
+    oled.print(textoEvaporacion());
+  }
 
-  /* FILA 7 */
+  /* FILA 7 - confirmacion / sensores activos */
   oled.setCursor(1, 7);
 
   if (estado == ESTADO_DEGRADADO) {
-    oled.print(F("SIN CONFIRMAR"));
+    oled.print(F("Sin confirmar"));
   }
   else if (inicioCondicionCritica != 0 && estado != ESTADO_CRITICO) {
     oled.print(F("Verificando..."));
   }
   else {
-    oled.print(F("Est:"));
-    oled.print(letraEstado());
+    oled.print(F("Sensores: "));
+    oled.print(sensoresDatos);
+    oled.print(F("/3"));
   }
 }
 
@@ -836,10 +893,12 @@ void imprimirEstadoSensores() {
 /* ============================================================
    SERIAL - DATOS
 
-   NOTA: esta funcion imprime una linea tipo CSV al final
-   (LOG,...) pensada para poder pegar la salida del Monitor
-   Serial en un archivo y procesarla despues en Python para
-   el analisis offline de K-Means que va en la wiki.
+   NOTA: al final imprime una linea tipo CSV (LOG,...) para
+   poder pegar la salida del Monitor Serial en un archivo y
+   procesarla despues en Python (analisis offline de K-Means
+   que va en la wiki, y ahora tambien queda ahi el dato de
+   probabilidad de evaporacion por si sirve para comparar
+   contra el consumo real de agua).
    ============================================================ */
 
 void imprimirDatosSerial() {
@@ -876,6 +935,24 @@ void imprimirDatosSerial() {
   if (isnan(luminosidad)) Serial.println(F("ERROR"));
   else { Serial.print(luminosidad, 1); Serial.println(F(" %")); }
 
+  /* v7: la evaporacion es su propia lectura, al mismo nivel
+     que nivel/temperatura/humedad, no un derivado escondido
+     entre los datos de IRH. Incluye numero + categoria en
+     palabras (BAJA/MEDIA/ALTA). */
+  Serial.print(F("Posible evaporacion:"));
+  if (isnan(probabilidadEvaporacion)) {
+    Serial.println(F(" SIN DATOS"));
+  } else {
+    Serial.print(F(" "));
+    Serial.print(probabilidadEvaporacion, 1);
+    Serial.print(F(" % ("));
+    Serial.print(textoEvaporacion());
+    Serial.println(F(")"));
+  }
+
+  Serial.println();
+  Serial.println(F("--- Analitica interna (IRH) ---"));
+
   Serial.print(F("IRH base:           "));
   if (sensoresDatos == 0) Serial.println(F("SIN DATOS"));
   else                    Serial.println(IRHbase, 1);
@@ -888,7 +965,10 @@ void imprimirDatosSerial() {
   Serial.println(datosConfiables() ? F("OK") : F("INSUFICIENTE"));
 
   Serial.print(F("Anomalias activas:  "));
-  Serial.println(anomalias);
+  Serial.print(anomalias);
+  Serial.print(F(" ("));
+  Serial.print(textoAnomalia());
+  Serial.println(F(")"));
 
   Serial.print(F("Estado:             "));
   Serial.println(textoEstado());
@@ -903,7 +983,9 @@ void imprimirDatosSerial() {
 
   Serial.println(F("--------------------------------"));
 
-  /* Linea CSV para copiar/pegar y analizar offline */
+  /* Linea CSV para copiar/pegar y analizar offline.
+     v6: se agrego la columna de probabilidad de evaporacion
+     al final. */
   Serial.print(F("LOG,"));
   Serial.print(millis());       Serial.print(F(","));
   Serial.print(nivel);          Serial.print(F(","));
@@ -912,7 +994,8 @@ void imprimirDatosSerial() {
   Serial.print(humedad);        Serial.print(F(","));
   Serial.print(luminosidad);    Serial.print(F(","));
   Serial.print(IRH);            Serial.print(F(","));
-  Serial.println(anomalias);
+  Serial.print(anomalias);      Serial.print(F(","));
+  Serial.println(probabilidadEvaporacion);
 }
 
 
@@ -932,8 +1015,7 @@ void setup() {
   pinMode(PIN_LED_ROJO,     OUTPUT);
   pinMode(PIN_BUZZER,       OUTPUT);
   pinMode(PIN_LUZ,          INPUT);
-  /* PIN_FOTORESISTENCIA (A0) no necesita pinMode: los pines
-     analogicos ya estan listos para analogRead() */
+  /* PIN_FOTORESISTENCIA (A0) no necesita pinMode */
 
   /* ---------- OLED ---------- */
   oled.begin();
@@ -1060,6 +1142,7 @@ void setup() {
   /* ---------- PRIMER ESTADO ---------- */
   calcularIRHBase();
   actualizarAnaliticaIRH();
+  calcularProbabilidadEvaporacion();
   actualizarEstado();
   actualizarSalidas();
   actualizarOLED();
@@ -1101,6 +1184,7 @@ void loop() {
   /* ---------- ANALITICA + ESTADO ---------- */
   calcularIRHBase();
   actualizarAnaliticaIRH();
+  calcularProbabilidadEvaporacion();
   actualizarEstado();
 
   /* ---------- SALIDAS ---------- */
